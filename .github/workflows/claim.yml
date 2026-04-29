@@ -1,0 +1,25 @@
+name: OxinChain Full Auto Bot
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 9:00 PM UTC = 2:00 AM Pakistan time
+    - cron: '0 9 * * *'    # 9:00 AM UTC = 2:00 PM Pakistan time
+  workflow_dispatch:
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        run: python oxin_claimer.py --once

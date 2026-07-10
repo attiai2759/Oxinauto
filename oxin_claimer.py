@@ -8,7 +8,7 @@ Step 3: Verify recipient username
 Step 4: Send all wallet coins to recipient
 
 pip install requests
-python oxin_full.py            # loop every 24h
+python oxin_full.py            # loop every 12h
 python oxin_full.py --once     # run once (GitHub Actions)
 """
 
@@ -23,12 +23,13 @@ ACCOUNTS_FILE  = "accounts.json"
 CLAIM_INTERVAL = 12 * 60 * 60   # 12 hours (runs twice a day)
 
 BASE             = "https://mine.oxinchain.io"
-URL_LOGIN        = f"{BASE}/api/auth/login"
-URL_CLAIM        = f"{BASE}/api/user/claim"
-URL_PROFILE      = f"{BASE}/api/user/profile"
-URL_TRANSFER_BAL = f"{BASE}/api/user/transfer-balance"
-URL_VERIFY       = f"{BASE}/api/wallet/verify-recipient"
-URL_SEND         = f"{BASE}/api/wallet/send"
+API_BASE         = "https://oxappapi.oxinchain.io/v1"   # real API base
+URL_LOGIN        = f"{API_BASE}/auth/login.php"
+URL_CLAIM        = f"{API_BASE}/user/claim-reward.php"   # ✔ fixed
+URL_PROFILE      = f"{API_BASE}/user/profile.php"
+URL_TRANSFER_BAL = f"{API_BASE}/user/transfer-balance.php"
+URL_VERIFY       = f"{API_BASE}/wallet/verify-recipient.php"
+URL_SEND         = f"{API_BASE}/wallet/send.php"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -45,9 +46,9 @@ def base_headers() -> dict:
     return {
         "Content-Type": "application/json",
         "Accept":       "application/json",
-        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
-        "Origin":       BASE,
-        "Referer":      f"{BASE}/dashboard",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "Origin":       "https://mine.oxinchain.io",
+        "Referer":      "https://mine.oxinchain.io/",
     }
 
 
@@ -79,9 +80,10 @@ def parse(resp: requests.Response) -> dict:
     already  = any(w in msg_low for w in
                    ["too early","already","wait","cooldown","not yet","please wait","next claim"]
                    ) and code in (200, 400, 409, 429)
+    # handle both "success": true and "status": "success"
     success  = (not already) and (
         (isinstance(data, dict) and data.get("success") is True) or
-        (isinstance(data, dict) and str(data.get("status","")).lower() == "ok") or
+        (isinstance(data, dict) and str(data.get("status","")).lower() in ("ok","success")) or
         (code in (200, 201) and any(w in msg_low for w in
          ["success","mined","collected","done","complete","ok","transferred","sent"]))
     )
@@ -89,72 +91,77 @@ def parse(resp: requests.Response) -> dict:
             "msg": msg, "wait": wait_str, "amount": amount,
             "raw": raw[:500], "data": data}
 
+# ── IP / Location Info ────────────────────────────────────────────────────────
+
+def log_runner_info() -> None:
+    """Fetch and log the public IP and geolocation of the machine running the bot."""
+    log.info("=" * 45)
+    log.info("  🌐  Fetching runner IP & location...")
+    try:
+        resp = requests.get("https://ipinfo.io/json", timeout=10)
+        if resp.status_code == 200:
+            info     = resp.json()
+            ip       = info.get("ip",       "unknown")
+            city     = info.get("city",     "unknown")
+            region   = info.get("region",   "unknown")
+            country  = info.get("country",  "unknown")
+            org      = info.get("org",      "unknown")
+            timezone = info.get("timezone", "unknown")
+            loc      = info.get("loc",      "unknown")
+            log.info(f"  🌐  Runner IP      : {ip}")
+            log.info(f"  📍  Location       : {city}, {region}, {country}")
+            log.info(f"  🏢  ISP / Org      : {org}")
+            log.info(f"  🕐  Timezone       : {timezone}")
+            log.info(f"  🗺️   Coordinates    : {loc}")
+        else:
+            log.warning(f"  ⚠  ipinfo.io returned HTTP {resp.status_code}")
+    except Exception as e:
+        log.warning(f"  ⚠  IP lookup failed: {e}")
+    log.info("=" * 45)
+
 # ── Step 0: Login ─────────────────────────────────────────────────────────────
 
 def step_login(email: str, password: str) -> str | None:
-    """Login with email/password and return fresh Bearer token."""
+    """
+    Login with email + password → return Bearer token.
+    Uses oxappapi.oxinchain.io (real API) not mine.oxinchain.io.
+    No CAPTCHA needed — slider is frontend-only, server ignores it.
+    Sends static lat/lng to satisfy payload schema.
+    """
     log.info("  [0/4] Logging in...")
+    payload = {
+        "identifier":   email,
+        "password":     password,
+        "login_method": "email",
+        "latitude":     31.5204,    # static Lahore coords — server doesn't validate
+        "longitude":    74.3587,
+    }
+    try:
+        resp = requests.post(URL_LOGIN, json=payload,
+                             headers=base_headers(), timeout=15)
+    except Exception as e:
+        log.error(f"  ✘  Login request error: {e}")
+        return None
 
-    # Try common login endpoint patterns
-    login_urls = [
-        f"{BASE}/api/auth/login",
-        f"{BASE}/api/user/login",
-        f"{BASE}/api/login",
-        f"{BASE}/api/auth/signin",
-    ]
+    log.debug(f"  Login [{resp.status_code}]: {resp.text[:300]}")
 
-    payloads = [
-        {"identifier": email, "password": password},   # confirmed by server error message
-        {"email": email, "password": password},
-        {"username": email, "password": password},
-    ]
+    if resp.status_code == 401:
+        log.error("  ✘  LOGIN FAILED — wrong email or password.")
+        log.error(f"     Check credentials in accounts.json for: {email}")
+        return None
 
-    for url in login_urls:
-        for payload in payloads:
-            try:
-                resp = requests.post(url, json=payload,
-                                     headers=base_headers(), timeout=15)
-            except Exception as e:
-                log.error(f"  ✘  Login request error: {e}")
-                return None
+    if resp.status_code in (200, 201):
+        data  = resp.json()
+        # server returns: {"status":"success","message":"Login successful","token":"...","user":{...}}
+        token = data.get("token") or data.get("access_token") or data.get("auth_token")
+        if token:
+            log.info(f"  ✔  Login successful!")
+            return f"Bearer {token}"
+        log.warning(f"  ⚠  HTTP 200 but no token in response: {resp.text[:300]}")
+        return None
 
-            if resp.status_code == 404:
-                break   # wrong URL, try next
-
-            p = parse(resp)
-            pass  # handled outside
-
-            if resp.status_code == 401 or "invalid" in p["msg"].lower() or \
-               "wrong" in p["msg"].lower() or "incorrect" in p["msg"].lower():
-                log.error("  ✘  LOGIN FAILED — wrong email or password.")
-                log.error(f"     Check credentials in accounts.json for {email}")
-                return None
-
-            # Extract token from response
-            if resp.status_code in (200, 201):
-                data = p["data"]
-                token = (
-                    # Check inside data.data first (confirmed: data.auth_token)
-                    (data.get("data", {}) or {}).get("auth_token") or
-                    (data.get("data", {}) or {}).get("token") or
-                    (data.get("data", {}) or {}).get("access_token") or
-                    # Also check top level
-                    data.get("auth_token") or
-                    data.get("token") or
-                    data.get("access_token") or
-                    data.get("x-auth-token")
-                )
-                if token:
-                    if not token.startswith("Bearer "):
-                        token = f"Bearer {token}"
-                    log.info(f"  ✔  Login successful — token received!")
-                    return token
-                else:
-                    log.warning(f"  ⚠  HTTP 200 but no token found in response.")
-                    log.warning(f"     Full response: {p['raw']}")
-
-    log.error("  ✘  Login failed — could not get token.")
-    log.error("     Share the login response above and I will fix token extraction.")
+    p = parse(resp)
+    log.error(f"  ✘  Login failed [{resp.status_code}]: {p['msg']}")
     return None
 
 # ── Step 1: Claim ─────────────────────────────────────────────────────────────
@@ -225,61 +232,6 @@ def step_transfer_to_wallet(session: requests.Session) -> bool:
             continue
     log.error("  ✘  Transfer to wallet failed.")
     return False
-
-# ── Step 2b: Transfer all coins to Web3 wallet ───────────────────────────────
-
-def step_transfer_to_web3(session: requests.Session, wallet_address: str, profile_data: dict = None) -> bool:
-    log.info(f"  [2b] Transferring all coins to Web3 wallet {wallet_address[:10]}...")
-
-    # Get total balance
-    total_bal = 0.0
-    try:
-        for url in [URL_PROFILE, f"{BASE}/api/user/dashboard"]:
-            resp = session.get(url, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    ui = data["data"]["user_info"]
-                    total_bal = float(ui.get("total_balance") or ui.get("verified_balance") or 0)
-                    if total_bal > 0:
-                        break
-                except Exception:
-                    pass
-        log.info(f"  Total balance available: {total_bal}")
-    except Exception as e:
-        log.warning(f"  Could not fetch balance: {e}")
-
-    if total_bal <= 0:
-        log.warning("  ⚠  Total balance is 0 — nothing to transfer to Web3 wallet.")
-        return True
-
-    payload = {
-        "amount": int(total_bal),
-        "wallet_address": wallet_address
-    }
-    log.info(f"  Sending payload: {payload}")
-    try:
-        resp = session.post(URL_TRANSFER_BAL, json=payload, timeout=15)
-    except Exception as e:
-        log.error(f"  ✘  Web3 transfer error: {e}")
-        return False
-
-    p = parse(resp)
-    log.info(f"  Server [{p['code']}]: {p['raw']}")
-
-    if p["code"] == 401:
-        log.error("  ✘  UNAUTHORIZED.")
-        return False
-    if p["success"] or p["code"] in (200, 201):
-        log.info(f"  ✔  Web3 transfer successful — {int(total_bal)} OXIN sent to {wallet_address}!")
-        return True
-    if any(w in p["msg"].lower() for w in ["insufficient","empty","zero","no balance"]):
-        log.warning("  ⚠  No balance to transfer.")
-        return True
-
-    log.error(f"  ✘  Web3 transfer failed — {p['code']}: {p['msg']}")
-    return False
-
 
 # ── Step 3: Get wallet balance ────────────────────────────────────────────────
 
@@ -356,10 +308,10 @@ def step_send(session: requests.Session, username: str, amount: float) -> bool:
         log.error("  ✘  Wallet balance is 0 — nothing to send.")
         return False
     payload = {
-        "recipient":     username,
-        "amount":        int(amount),
-        "token_symbol":  "OXIN",
-        "method":        "Username"
+        "recipient":    username,
+        "amount":       int(amount),
+        "token_symbol": "OXIN",
+        "method":       "Username"
     }
     try:
         resp = session.post(URL_SEND, json=payload, timeout=15)
@@ -391,6 +343,7 @@ def process_account(acc: dict) -> None:
     print()
     print("=" * 45)
     log.info(f"  Account    : {label}")
+    log.info(f"  Email      : {email}")
     log.info(f"  Web3 Wallet: {web3_wallet if web3_wallet else '(not set)'}")
     print("=" * 45)
 
@@ -400,19 +353,17 @@ def process_account(acc: dict) -> None:
 
     try:
         # 0. Login
-        log.info("  ⏳  Trying to login...")
         token = step_login(email, password)
         if not token:
             log.error("  ✘  Login failed — check email/password in accounts.json")
             return
-        log.info("  ✔  Login successful!")
         time.sleep(2)
 
         session = requests.Session()
         session.headers.update(auth_headers(token))
 
         # 1. Claim
-        log.info("  ⏳  Claiming daily coins...")
+        log.info("  [1/4] ⏳  Claiming daily coins...")
         if not step_claim(session):
             log.error("  ✘  Claim failed — stopping.")
             return
@@ -446,7 +397,7 @@ def process_account(acc: dict) -> None:
             log.warning("  ⚠  Balance is 0 — nothing to transfer.")
             return
 
-        log.info(f"  ⏳  Sending {int(total_bal)} OXIN to Web3 wallet...")
+        log.info(f"  [3/4] ⏳  Sending {int(total_bal)} OXIN to Web3 wallet...")
         payload = {"amount": int(total_bal), "wallet_address": web3_wallet}
         try:
             resp = session.post(URL_TRANSFER_BAL, json=payload, timeout=15)
@@ -498,10 +449,13 @@ def main():
     print("   OxinChain Full Auto Bot")
     print("=" * 45)
     print(f"   Accounts  : {len(accounts)}")
+    print(f"   Login     : Email + Password (no CAPTCHA)")
     print(f"   Mode      : {'Run once (GitHub Actions)' if once else 'Loop every 12h'}")
-    print(f"   Steps     : Login → Claim → Transfer Verified → Transfer to Web3 Wallet")
+    print(f"   Steps     : Login → Claim → Balance → Transfer to Web3")
     print(f"   Log file  : oxin_full.log")
     print("=" * 45)
+
+    log_runner_info()
 
     if once:
         run_cycle(accounts)
